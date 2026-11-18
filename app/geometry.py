@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from shapely.geometry import LinearRing, Polygon, mapping
+from shapely.geometry import LinearRing, Point, Polygon, mapping, shape
 from shapely.validation import explain_validity
 
 from .models import RevisionIn
@@ -250,3 +250,24 @@ def build_polygon_geojson(payload: RevisionIn) -> dict:
         )
 
     return mapping(polygon)
+
+
+def classify_point(geometry: dict, lat: float, lon: float) -> str:
+    """Classify one monitoring point against a GeoJSON Polygon geometry.
+
+    Returns:
+
+    * ``"inside"``   – strictly inside the water area;
+    * ``"outside"``  – outside the outer ring *or* strictly inside a hole
+      (a hole is dry land);
+    * ``"boundary"`` – exactly on the outer ring or on a hole boundary
+      (undecidable, reported as ``pending`` by the monitoring state machine).
+    """
+    polygon = shape(geometry)
+    point = Point(lon, lat)
+    if polygon.contains(point):
+        return "inside"
+    if polygon.covers(point):
+        # Not contained but still covered -> lies exactly on a ring.
+        return "boundary"
+    return "outside"

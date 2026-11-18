@@ -22,6 +22,8 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
+from .geometry import classify_point
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS revisions (
     relation_id          INTEGER NOT NULL,
@@ -34,6 +36,49 @@ CREATE TABLE IF NOT EXISTS revisions (
     error_way_ids_json   TEXT,
     created_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (relation_id, revision)
+);
+
+-- One immutable group of monitoring points per relation.
+CREATE TABLE IF NOT EXISTS monitor_registrations (
+    relation_id       INTEGER NOT NULL PRIMARY KEY,
+    baseline_revision INTEGER NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS monitor_points (
+    relation_id          INTEGER NOT NULL
+                         REFERENCES monitor_registrations(relation_id) ON DELETE CASCADE,
+    point_id             INTEGER NOT NULL,
+    lat                  REAL    NOT NULL,
+    lon                  REAL    NOT NULL,
+    baseline_state       TEXT    NOT NULL CHECK (baseline_state IN ('inside', 'outside')),
+    -- Last unambiguous inside/outside state; 'pending' and invalid
+    -- revisions never overwrite it, so comparison always resumes from
+    -- the last definite state before any interruption.
+    last_definite_state  TEXT    NOT NULL CHECK (last_definite_state IN ('inside', 'outside')),
+    PRIMARY KEY (relation_id, point_id)
+);
+
+-- Point states as of every revision processed after registration.
+-- Invalid revisions carry the previous states over unchanged.
+CREATE TABLE IF NOT EXISTS revision_point_states (
+    relation_id INTEGER NOT NULL,
+    revision    INTEGER NOT NULL,
+    point_id    INTEGER NOT NULL,
+    state       TEXT NOT NULL CHECK (state IN ('inside', 'outside', 'pending')),
+    PRIMARY KEY (relation_id, revision, point_id),
+    FOREIGN KEY (relation_id, revision) REFERENCES revisions(relation_id, revision)
+);
+
+-- In/out events: at most one per point per revision.
+CREATE TABLE IF NOT EXISTS monitor_events (
+    relation_id INTEGER NOT NULL,
+    revision    INTEGER NOT NULL,
+    point_id    INTEGER NOT NULL,
+    direction   TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (relation_id, revision, point_id),
+    FOREIGN KEY (relation_id, revision) REFERENCES revisions(relation_id, revision)
 );
 """
 
@@ -74,12 +119,25 @@ class Database:
 
     def init_schema(self) -> None:
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            # Idempotent DDL in autocommit mode; the busy timeout makes
+            # concurrent starters queue on the schema write lock.
+            conn.executescript(SCHEMA)
+
+    @staticmethod
+    def _begin_immediate(conn: sqlite3.Connection) -> None:
+        attempt = 0
+        while True:
             try:
-                conn.execute(SCHEMA)
-                conn.commit()
-            except Exception:
-                conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                # Another writer holds the lock; busy_timeout usually
+                # makes the execute block, but keep an explicit retry
+                # for the edge case where it returns immediately.
+                if "locked" in str(exc).lower() and attempt < LOCK_RETRIES:
+                    attempt += 1
+                    time.sleep(0.05 * attempt)
+                    continue
                 raise
 
     # ------------------------------------------------------------------ writes
@@ -91,27 +149,20 @@ class Database:
         input_payload: dict,
         geometry: dict | None,
         error: dict | None,
-    ) -> None:
+    ) -> dict | None:
         """Atomically persist one full revision.
+
+        Returns the monitoring outcome (point states + events) attached to
+        this revision, or ``None`` when the relation has no registered
+        monitoring points. The monitoring rows are written in the same
+        transaction as the revision itself, so a later per-revision read
+        always returns exactly what the upload response reported.
 
         Raises :class:`RevisionConflict` when ``revision`` is not strictly
         greater than every existing revision of the relation.
         """
         with self._connect() as conn:
-            attempt = 0
-            while True:
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    break
-                except sqlite3.OperationalError as exc:
-                    # Another writer holds the lock; busy_timeout usually
-                    # makes the execute block, but keep an explicit retry
-                    # for the edge case where it returns immediately.
-                    if "locked" in str(exc).lower() and attempt < LOCK_RETRIES:
-                        attempt += 1
-                        time.sleep(0.05 * attempt)
-                        continue
-                    raise
+            self._begin_immediate(conn)
             try:
                 row = conn.execute(
                     "SELECT MAX(revision) AS max_rev FROM revisions WHERE relation_id = ?",
@@ -142,12 +193,171 @@ class Database:
                         json.dumps(error["way_ids"]) if error else None,
                     ),
                 )
+                monitoring = self._apply_monitoring(conn, relation_id, revision, status, geometry)
                 conn.commit()
+                return monitoring
             except RevisionConflict:
                 raise
             except Exception:
                 conn.rollback()
                 raise
+
+    # -------------------------------------------------------------- monitoring
+    @staticmethod
+    def _apply_monitoring(
+        conn: sqlite3.Connection,
+        relation_id: int,
+        revision: int,
+        status: str,
+        geometry: dict | None,
+    ) -> dict | None:
+        """Compute and store monitoring rows for a freshly inserted revision.
+
+        Runs inside the revision's own transaction: the registered points,
+        their last definite states and the new revision are all seen from
+        the same committed order, so interleaved registrations/uploads are
+        serialised by the database write lock.
+        """
+        registered = conn.execute(
+            "SELECT 1 FROM monitor_registrations WHERE relation_id = ?",
+            (relation_id,),
+        ).fetchone()
+        if registered is None:
+            return None
+
+        points = conn.execute(
+            "SELECT point_id, lat, lon, baseline_state, last_definite_state "
+            "FROM monitor_points WHERE relation_id = ? ORDER BY point_id",
+            (relation_id,),
+        ).fetchall()
+
+        events: list[dict] = []
+        if status == "valid":
+            states: list[tuple[int, str]] = []
+            for p in points:
+                cls = classify_point(geometry, p["lat"], p["lon"])
+                state = "pending" if cls == "boundary" else cls
+                states.append((p["point_id"], state))
+                if state != "pending" and state != p["last_definite_state"]:
+                    # Definite again and changed vs. the last definite state
+                    # (baseline or an earlier valid revision, skipping any
+                    # pending/invalid interruption).
+                    events.append(
+                        {
+                            "point_id": p["point_id"],
+                            "direction": "in" if state == "inside" else "out",
+                            "revision": revision,
+                        }
+                    )
+            for point_id, state in states:
+                if state != "pending":
+                    conn.execute(
+                        "UPDATE monitor_points SET last_definite_state = ? "
+                        "WHERE relation_id = ? AND point_id = ?",
+                        (state, relation_id, point_id),
+                    )
+        else:
+            # Invalid revision: point states are carried over unchanged and
+            # no events are produced; the next valid revision still compares
+            # against the pre-interruption definite states.
+            prev = conn.execute(
+                "SELECT MAX(revision) AS prev_rev FROM revision_point_states "
+                "WHERE relation_id = ? AND revision < ?",
+                (relation_id, revision),
+            ).fetchone()["prev_rev"]
+            if prev is None:
+                # First processed revision since registration: the baseline
+                # states are the ones still in force.
+                states = [(p["point_id"], p["baseline_state"]) for p in points]
+            else:
+                rows = conn.execute(
+                    "SELECT point_id, state FROM revision_point_states "
+                    "WHERE relation_id = ? AND revision = ? ORDER BY point_id",
+                    (relation_id, prev),
+                ).fetchall()
+                states = [(r["point_id"], r["state"]) for r in rows]
+
+        conn.executemany(
+            "INSERT INTO revision_point_states (relation_id, revision, point_id, state) "
+            "VALUES (?, ?, ?, ?)",
+            [(relation_id, revision, point_id, state) for point_id, state in states],
+        )
+        conn.executemany(
+            "INSERT INTO monitor_events (relation_id, revision, point_id, direction) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (relation_id, revision, e["point_id"], e["direction"])
+                for e in events
+            ],
+        )
+        return {
+            "points": [{"point_id": point_id, "state": state} for point_id, state in states],
+            "events": events,
+        }
+
+    def register_monitor_points(self, relation_id: int, points: list[dict]) -> dict:
+        """Atomically register the immutable monitoring points of a relation.
+
+        The baseline is computed from the current face (latest revision,
+        which must be valid) as seen inside the write transaction, so an
+        interleaved upload either commits first (and becomes the baseline)
+        or is processed after the registration — never a mix.
+
+        Raises :class:`AlreadyRegistered`, :class:`NoCurrentFace` or
+        :class:`PointOnBoundary`; on any failure nothing is stored.
+        """
+        with self._connect() as conn:
+            self._begin_immediate(conn)
+            try:
+                existing = conn.execute(
+                    "SELECT 1 FROM monitor_registrations WHERE relation_id = ?",
+                    (relation_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise AlreadyRegistered(
+                        f"relation {relation_id} already has registered monitoring points"
+                    )
+                latest = conn.execute(
+                    "SELECT revision, status, geometry_json FROM revisions "
+                    "WHERE relation_id = ? ORDER BY revision DESC LIMIT 1",
+                    (relation_id,),
+                ).fetchone()
+                if latest is None or latest["status"] != "valid":
+                    raise NoCurrentFace(
+                        f"relation {relation_id} has no valid current face to baseline against"
+                    )
+                geometry = json.loads(latest["geometry_json"])
+                classified: list[tuple[dict, str]] = []
+                boundary_ids: list[int] = []
+                for p in points:
+                    cls = classify_point(geometry, p["lat"], p["lon"])
+                    if cls == "boundary":
+                        boundary_ids.append(p["id"])
+                    else:
+                        classified.append((p, cls))
+                if boundary_ids:
+                    raise PointOnBoundary(boundary_ids)
+                conn.execute(
+                    "INSERT INTO monitor_registrations (relation_id, baseline_revision) "
+                    "VALUES (?, ?)",
+                    (relation_id, latest["revision"]),
+                )
+                conn.executemany(
+                    "INSERT INTO monitor_points (relation_id, point_id, lat, lon, "
+                    "baseline_state, last_definite_state) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (relation_id, p["id"], p["lat"], p["lon"], cls, cls)
+                        for p, cls in classified
+                    ],
+                )
+                conn.commit()
+            except (AlreadyRegistered, NoCurrentFace, PointOnBoundary):
+                conn.rollback()
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+        return self.get_registration(relation_id)
 
     # ------------------------------------------------------------------- reads
     @staticmethod
@@ -204,8 +414,87 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    # -------------------------------------------------------- monitoring reads
+    def get_registration(self, relation_id: int) -> dict | None:
+        with self._connect() as conn:
+            reg = conn.execute(
+                "SELECT relation_id, baseline_revision, created_at "
+                "FROM monitor_registrations WHERE relation_id = ?",
+                (relation_id,),
+            ).fetchone()
+            if reg is None:
+                return None
+            points = conn.execute(
+                "SELECT point_id, lat, lon, baseline_state FROM monitor_points "
+                "WHERE relation_id = ? ORDER BY point_id",
+                (relation_id,),
+            ).fetchall()
+            return {
+                "relation_id": reg["relation_id"],
+                "baseline_revision": reg["baseline_revision"],
+                "created_at": reg["created_at"],
+                "points": [
+                    {
+                        "id": p["point_id"],
+                        "lat": p["lat"],
+                        "lon": p["lon"],
+                        "baseline_state": p["baseline_state"],
+                    }
+                    for p in points
+                ],
+            }
+
+    def get_revision_monitoring(self, relation_id: int, revision: int) -> dict | None:
+        """Stored point states and events of one revision (None if not processed)."""
+        with self._connect() as conn:
+            states = conn.execute(
+                "SELECT point_id, state FROM revision_point_states "
+                "WHERE relation_id = ? AND revision = ? ORDER BY point_id",
+                (relation_id, revision),
+            ).fetchall()
+            if not states:
+                return None
+            events = conn.execute(
+                "SELECT point_id, direction, revision FROM monitor_events "
+                "WHERE relation_id = ? AND revision = ? ORDER BY point_id",
+                (relation_id, revision),
+            ).fetchall()
+            return {
+                "points": [dict(s) for s in states],
+                "events": [dict(e) for e in events],
+            }
+
+    def list_monitor_events(self, relation_id: int) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT point_id, direction, revision FROM monitor_events "
+                "WHERE relation_id = ? ORDER BY revision, point_id",
+                (relation_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
 
 class RevisionConflict(Exception):
     def __init__(self, message: str, latest: int):
         super().__init__(message)
         self.latest = latest
+
+
+class AlreadyRegistered(Exception):
+    """The relation already has an (immutable) monitoring-point group."""
+
+
+class NoCurrentFace(Exception):
+    """Registration requires a valid currently-served face."""
+
+
+class PointOnBoundary(Exception):
+    """One or more points lie exactly on the outer ring or a hole boundary."""
+
+    def __init__(self, point_ids: list[int]):
+        self.point_ids = sorted(point_ids)
+        super().__init__(
+            "monitoring point(s) "
+            + ", ".join(str(i) for i in self.point_ids)
+            + " lie on the outer ring or a hole boundary"
+        )
